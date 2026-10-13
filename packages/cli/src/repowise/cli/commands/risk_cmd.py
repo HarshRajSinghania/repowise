@@ -114,73 +114,164 @@ def project_risk(payload: dict) -> dict:
             out[key] = payload[key]
     note = _ta.index_note(payload)
     if note:
-        out["index_note"] = note
+        out["index"] = note
     return out
 
 
-@dataclass(frozen=True)
-class _Subject:
-    repo_path: Path
-    revspec: str | None
-    fmt: str
-    fail_above: float | None
+def _target_risk(
+    repo_path: str,
+    targets: tuple[str, ...],
+    changed_files: tuple[str, ...],
+    fmt: str,
+    full: bool,
+) -> None:
+    """``--target``: what history says about touching these files."""
+    fmt = _ta.resolve_format_for(fmt, full)
+    repo = _ta.resolve_indexed_repo(
+        path=repo_path,
+        repo_alias=None,
+        no_workspace=False,
+        fmt=fmt,
+        command="risk",
+    )
+
+    def _factory():
+        from repowise.server.mcp_server.tool_risk.get_risk import get_risk
+
+        return get_risk(
+            targets=list(targets),
+            changed_files=list(changed_files) or None,
+            # _render_target_risk prints risk_type, change_magnitude, owner share,
+            # bus factor, contributor count, and recent owner; --format json keeps
+            # the PR blast radius the tool serves only on request.
+            include=["churn", "owners", "blast"],
+        )
+
+    payload = _ta.run(repo, _factory, "get_risk")
+
+    if full:
+        _ta.emit_full(payload)
+        return
+    _ta.emit_error(payload, fmt, extra={"targets": list(targets)})
+    projected = project_risk(payload)
+    if fmt == "json":
+        emit_json(projected)
+        return
+    _render_target_risk(projected, targets)
+    _ta.print_index_note(payload, fmt)
 
 
-def _score(
-    subject: _Subject, extensions: tuple[str, ...], exclude: tuple[str, ...], baseline: int
-) -> ChangeRiskResult:
-    """Score the change, or exit 2 when it cannot be read or, gated, ranked."""
-    status = ci_notices(subject.fmt)
-    # Verify a single commit ref exists before announcing baseline sampling.
-    # Skip ranges (contain ..) and empty revspecs; score_live_change handles those.
-    revspec = subject.revspec
-    if revspec and ".." not in revspec:
-        try:
-            subprocess.run(
-                ["git", "rev-parse", "--verify", f"{revspec}^{{commit}}"],
-                cwd=subject.repo_path,
-                check=True,
-                capture_output=True,
-                text=True,
+def _render_target_risk(projected: dict, requested: tuple[str, ...]) -> None:
+    """The human path for ``--target``: the directive first, then a card each."""
+    from rich.markup import escape
+
+    directive = projected.get("directive")
+    if directive:
+        # PR mode leads with the directive because that is the tool's contract:
+        # what may break, what is missing, what to run.
+        console.print(f"\n[bold]Directive[/bold] {escape(str(directive.get('summary', '')))}")
+        for label, key in (
+            ("May break", "may_break"),
+            ("Missing co-changes", "missing_cochanges"),
+            ("Files without tests", "missing_tests"),
+            ("Tests to run", "tests_to_run"),
+        ):
+            _print_list(label, directive.get(key) or [])
+        for label, key in _DIRECTIVE_RECORD_BLOCKS:
+            _print_records(
+                label,
+                directive.get(key) or [],
+                key,
+                truncated=directive.get(f"{key}_truncated") or 0,
             )
-        except subprocess.CalledProcessError as exc:
-            detail = (exc.stderr or "").strip().split("\n")[0] or str(exc)
-            cannot_evaluate(
-                subject.fmt,
-                "change_unreadable",
-                f"Could not read change {revspec!r} in {subject.repo_path}: {detail}",
-            )
-    if baseline and subject.fmt == "table":
-        status.print(f"[dim]Sampling up to {baseline} recent commits…[/dim]")
-    try:
-        result = score_live_change(
-            subject.repo_path,
-            subject.revspec,
-            extensions=extensions,
-            exclude_patterns=exclude,
-            baseline=baseline,
-        )
-    except subprocess.CalledProcessError as exc:
-        detail = (exc.stderr or "").strip().split("\n")[0] or str(exc)
-        cannot_evaluate(
-            subject.fmt,
-            "change_unreadable",
-            f"Could not read change {subject.revspec or 'HEAD'!r} in {subject.repo_path}: {detail}",
-        )
-    except Exception as exc:
-        # Other errors (not a repo, missing history, etc.) cannot be scored.
-        cannot_evaluate(
-            subject.fmt,
-            "change_unreadable",
-            f"Could not read change {subject.revspec or 'HEAD'!r} in {subject.repo_path}: {exc}",
-        )
-    if subject.fail_above is not None and result.percentile is None:
-        from repowise.core.analysis.change_risk.render import unranked_reason
+        calls = directive.get("next_calls") or []
+        _print_list("Then run", [c["cli"] for c in calls if c.get("cli")])
 
-        cannot_evaluate(subject.fmt, "no_baseline", unranked_reason(result, baseline))
-    if result.features.nf == 0:
-        status.print(
-            f"[yellow]No counted file changes in {result.features.ref!r} "
-            f"(check the revspec, --ext, or exclusion filters).[/yellow]"
+    targets = projected.get("targets") or {}
+    for name in requested:
+        card = targets.get(name)
+        if card is None:
+            # An excluded path is filtered out of the request before the tool
+            # sees it, so a requested target with no card is an answer ("this
+            # is not indexed here"), not a gap to render as an empty section.
+            console.print(f"\n[yellow]{escape(name)} — not indexed (or excluded).[/yellow]")
+            continue
+        _render_card(name, card)
+    # Anything the tool returned that was not asked for by name (it normalises
+    # paths), so a caller never loses a card to a spelling difference.
+    for name, card in targets.items():
+        if name not in requested:
+            _render_card(name, card)
+
+    hotspots = projected.get("global_hotspots") or []
+    if hotspots:
+        table = Table(title="Elsewhere in this repo")
+        table.add_column("File", style="cyan")
+        table.add_column("Hotspot", justify="right")
+        table.add_column("Owner")
+        table.add_column("Fixes", justify="right")
+        for h in hotspots:
+            score = h.get("hotspot_score")
+            fixes = h.get("fix_count")
+            table.add_row(
+                escape(str(h.get("file_path", ""))),
+                "?" if score is None else f"{float(score):.0%}",
+                escape(str(h.get("primary_owner") or "unknown")),
+                "" if fixes is None else str(fixes),
+            )
+        console.print(table)
+        console.print(
+            "  [dim]Prior fixes are recency-weighted against this change's own date — "
+            "one from a year earlier counts a half.[/dim]"
         )
-    return result
+
+
+def _print_diff_shape(result: ChangeRiskResult) -> None:
+    """The supporting 0-10 diff-size score and its drivers."""
+    risk = result.risk
+    console.print(
+        f"  [dim]Diff-size score: {risk.score:.1f}/10 — how big and spread out the change is, "
+        f"not where it lands. Corpus-anchored to a single commit.[/dim]"
+    )
+
+    table = Table(title="Diff shape (each driver vs. the model's baseline commit)")
+    table.add_column("Driver")
+    table.add_column("Value", justify="right")
+    table.add_column("Push", justify="right")
+    for d in risk.top_drivers:
+        push_color = "red" if d.contribution > 0 else "green"
+        sign = "+" if d.contribution >= 0 else ""
+        table.add_row(
+            d.label,
+            "-" if d.value is None else f"{d.value:g}",
+            f"[{push_color}]{sign}{d.contribution:.2f}[/{push_color}]",
+        )
+    console.print(table)
+
+
+def _emit_machine(subject: _Subject, result: ChangeRiskResult) -> None:
+    """The json, markdown and github renderings of a scored change."""
+    from repowise.core.analysis.change_risk import render
+
+    fmt, fail_above = subject.fmt, subject.fail_above
+    if fmt == "json":
+        payload = change_risk_payload(result, scales=True)
+        groups = _independent_changes_for(subject.repo_path, result, subject.revspec)
+        if groups:
+            payload["independent_changes"] = groups
+        if fail_above is not None:
+            payload["gate"] = {
+                "fail_above_percentile": fail_above,
+                # Unrounded, as the gate compares it: ``risk_percentile`` is
+                # rounded to one decimal and can read as equal to the gate.
+                "percentile": result.percentile,
+                "status": render.percentile_gate(result, fail_above),
+            }
+        click.echo(json.dumps(payload, indent=2))
+    elif fmt == "markdown":
+        click.echo(render.render_markdown(result, fail_above), nl=False)
+    else:
+        for line in render.github_annotations(result, fail_above):
+            click.echo(line)
+        append_step_summary(render.render_markdown(result, fail_above))
+        console.print(render.headline(result, fail_above, markdown=False), markup=False)
